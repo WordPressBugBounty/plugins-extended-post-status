@@ -30,6 +30,9 @@ if (!defined('WP_UNINSTALL_PLUGIN')) {
  * Reset all posts with a custom status to status draft, so the posts don't
  * get lost and still appear in the backend.
  *
+ * The status definitions themselves are kept on purpose, so reinstalling the
+ * plugin restores them.
+ *
  * @since    1.0.16
  */
 // reregister taxonomy (plugin is already deactivated, so the taxonomy is no
@@ -39,22 +42,35 @@ $args = [
     'taxonomy' => 'status',
     'hide_empty' => false,
 ];
-$custom_status = get_terms($args); //
+$custom_status = get_terms($args);
 
-if (!empty($custom_status)) {
+if (!empty($custom_status) && !is_wp_error($custom_status)) {
     global $wpdb;
 
-    $status_list = [];
-    foreach ($custom_status as $status) {
-        $status_list[] = esc_sql($status->name);
-    }
-    $results = $wpdb->get_results('SELECT * FROM ' . $wpdb->prefix . 'posts WHERE post_status IN("' . implode('","', $status_list) . '")');
-    if (count($results) > 0) {
-        foreach ($results as $result) {
-            wp_update_post([
-                'ID' => $result->ID,
-                'post_status' => 'draft'
-            ]);
-        }
+    /*
+     * The post_status column holds the slug of a status, not its name. Earlier
+     * versions compared against the name, which silently matched nothing as
+     * soon as a status was named differently from its slug.
+     */
+    $status_list = wp_list_pluck($custom_status, 'slug');
+    $placeholders = implode(', ', array_fill(0, count($status_list), '%s'));
+
+    $post_ids = $wpdb->get_col(
+        $wpdb->prepare(
+            "SELECT ID FROM {$wpdb->posts} WHERE post_status IN ($placeholders)", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+            $status_list
+        )
+    );
+
+    foreach ($post_ids as $post_id) {
+        wp_update_post([
+            'ID' => (int) $post_id,
+            'post_status' => 'draft',
+        ]);
     }
 }
+
+// Remove the settings of the plugin itself. Per status settings are kept
+// together with the status terms.
+delete_option('extended-post-status-add-extra-admin-menu-item');
+delete_metadata('user', 0, '_extended_post_status_publish_sidebar_disabled', '', true);

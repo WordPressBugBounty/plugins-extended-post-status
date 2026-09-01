@@ -24,6 +24,9 @@ class Extended_Post_Status_i18n
     /**
      * Load the plugin text domain for translation.
      *
+     * Hooked to 'init'. Loading translations any earlier makes WordPress 6.7
+     * and later report that the text domain was triggered too early.
+     *
      * @since    1.0.0
      */
     public function load_plugin_textdomain()

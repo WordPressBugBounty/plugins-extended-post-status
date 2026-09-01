@@ -1,13 +1,14 @@
 === Extended Post Status ===
 Contributors: welly2103
-Tags: status, post, publishing, extended, statuses, page, post type
-Requires at least: 4.9
-Tested up to: 6.8
+Tags: status, post, publishing, extended, post type
+Requires at least: 5.0
+Tested up to: 7.1
 Requires PHP: 7.2
-Stable tag: 6.8
+Stable tag: 1.1.0
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
-Description: Add new statuses to all post types (posts, pages, products, ...).
+
+Add new statuses to all post types (posts, pages, products, ...).
 
 == Description ==
 
@@ -60,7 +61,26 @@ To avoid misunderstandings in handling with own custom statuses, the button has 
 Likewise, the message that a post has been published has been renamed. This now only indicates that a post has been saved. The indicator whether a post is published or not should always be the status and not a message or button label.
 Furthermore, the publishing sidebar of Gutenberg has been removed.
 
+== Upgrade Notice ==
+
+= 1.1.0 =
+Compatibility release for WordPress 7.0. Please note one behaviour change: posts with a non public custom status are no longer listed in front end archives, feeds and search results for logged in editors. They stay previewable through their own URL, exactly like a draft. If you relied on the old behaviour, enable the "Public" option for that status.
+
 == Changelog ==
+
+= 1.1.0 =
+* [Added] Support for WordPress 7.0, still compatible with WordPress 5.0 and above
+* [Added] Custom statuses are shown with their name in the block editor sidebar again (WordPress 7.0 builds its own status control from a fixed list)
+* [Fixed] Custom statuses were missing in quick edit and bulk edit, because the mutation events used to detect the inline editor were removed from current browsers
+* [Fixed] Fatal error on PHP 8 when the settings of a status were missing
+* [Fixed] Posts with a non public custom status showed up in front end archives, feeds and search results for every logged in editor, and could be exposed to visitors by a page cache
+* [Fixed] Deleting the plugin did not reset posts whose status name differed from its slug
+* [Fixed] Translations are no longer loaded before the init action
+* [Fixed] Settings of a deleted status are removed instead of being kept forever
+* [Security] Escape status names and slugs in all admin output
+* [Security] Only store known status settings and verify capabilities when saving them
+* [Security] Validate the submitted status and check the capability of the post type before applying it, including REST API requests
+* [Changed] Performance: the translation filter no longer runs on the front end, the status list is cached per request, and the post overview no longer scans the whole posts table
 
 = 1.0.21 =
 * [Fixed] PHP incorrect calling of _load_textdomain_just_in_time

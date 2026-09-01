@@ -18,6 +18,63 @@ class Extended_Post_Status_Admin
 {
 
     /**
+     * The taxonomy used to store the custom statuses.
+     *
+     * @since    1.1.0
+     * @var      string
+     */
+    const TAXONOMY = 'status';
+
+    /**
+     * The option prefix used to store the settings of a single status.
+     *
+     * @since    1.1.0
+     * @var      string
+     */
+    const SETTINGS_OPTION_PREFIX = 'taxonomy_term_';
+
+    /**
+     * All available status settings and their default values.
+     *
+     * This is the single source of truth for the settings. It is used to render
+     * the form, to sanitize the submitted values and to normalize the stored
+     * values, so a status can never be missing a setting.
+     *
+     * @since    1.1.0
+     * @var      array
+     */
+    private static $setting_defaults = [
+        'public' => 0,
+        'show_in_admin_all_list' => 0,
+        'show_in_admin_status_list' => 0,
+        'hide_in_drop_down' => 0,
+    ];
+
+    /**
+     * Runtime cache for the custom status terms.
+     *
+     * @since    1.1.0
+     * @var      array|null
+     */
+    private static $status_cache = null;
+
+    /**
+     * Runtime cache for the status settings, keyed by term id.
+     *
+     * @since    1.1.0
+     * @var      array
+     */
+    private static $settings_cache = [];
+
+    /**
+     * Runtime cache for wp_count_posts() results, keyed by post type.
+     *
+     * @since    1.1.0
+     * @var      array
+     */
+    private static $count_cache = [];
+
+    /**
      * The ID of this plugin.
      *
      * @since    1.0.0
@@ -47,176 +104,350 @@ class Extended_Post_Status_Admin
     }
 
     /**
-     * Add the custom post type to backend post status dropdown
+     * Returns all custom status terms
+     *
+     * The result is cached for the current request, because the statuses are
+     * needed on every single request to register the post statuses.
+     *
+     * @return array
+     * @since    1.0.0
+     */
+    public static function get_status()
+    {
+        if (null !== self::$status_cache) {
+            return self::$status_cache;
+        }
+
+        // The taxonomy is not available before the 'init' action and it is gone
+        // while the plugin is being uninstalled.
+        if (!taxonomy_exists(self::TAXONOMY)) {
+            return [];
+        }
+
+        $terms = get_terms([
+            'taxonomy' => self::TAXONOMY,
+            'hide_empty' => false,
+            'update_term_meta_cache' => false,
+        ]);
+
+        if (is_wp_error($terms) || !is_array($terms)) {
+            $terms = [];
+        }
+
+        self::$status_cache = $terms;
+
+        return self::$status_cache;
+    }
+
+    /**
+     * Returns the settings of a single status
+     *
+     * Always returns an array containing every known setting normalized to 0 or
+     * 1. The stored option can be missing entirely or can be missing single
+     * keys when it was written by an older version of the plugin, so callers
+     * must never access the raw option.
+     *
+     * @param int $term_id
+     * @return array
+     * @since    1.1.0
+     */
+    public static function get_status_settings($term_id)
+    {
+        $term_id = (int) $term_id;
+
+        if (isset(self::$settings_cache[$term_id])) {
+            return self::$settings_cache[$term_id];
+        }
+
+        $stored = get_option(self::SETTINGS_OPTION_PREFIX . $term_id);
+        if (!is_array($stored)) {
+            $stored = [];
+        }
+
+        $settings = [];
+        foreach (self::$setting_defaults as $key => $default) {
+            $settings[$key] = (isset($stored[$key]) && $stored[$key]) ? 1 : 0;
+        }
+
+        self::$settings_cache[$term_id] = $settings;
+
+        return $settings;
+    }
+
+    /**
+     * Drop the runtime caches
+     *
+     * Called whenever a status is created, updated or deleted, so code running
+     * later in the same request sees the new values.
+     *
+     * @since    1.1.0
+     */
+    public static function flush_status_cache()
+    {
+        self::$status_cache = null;
+        self::$settings_cache = [];
+        self::$count_cache = [];
+    }
+
+    /**
+     * Returns the statuses that should be offered in the admin dropdowns
+     *
+     * A status flagged as hidden is only included when the current post already
+     * has it, otherwise saving the post would silently change its status.
+     *
+     * @param string $current_status
+     * @return array
+     * @since    1.1.0
+     */
+    private static function get_selectable_status($current_status = '')
+    {
+        $selectable = [];
+        foreach (self::get_status() as $single_status) {
+            $settings = self::get_status_settings($single_status->term_id);
+            if ($settings['hide_in_drop_down'] && $single_status->slug !== $current_status) {
+                continue;
+            }
+            $selectable[] = [
+                'slug' => $single_status->slug,
+                'name' => $single_status->name,
+            ];
+        }
+        return $selectable;
+    }
+
+    /**
+     * Returns only the given status, if it is one of the custom ones
+     *
+     * Used to keep the current status available in a dropdown for users who are
+     * not allowed to assign statuses.
+     *
+     * @param string $current_status
+     * @return array
+     * @since    1.1.0
+     */
+    private static function get_current_status_only($current_status)
+    {
+        foreach (self::get_status() as $single_status) {
+            if ($single_status->slug === $current_status) {
+                return [
+                    [
+                        'slug' => $single_status->slug,
+                        'name' => $single_status->name,
+                    ],
+                ];
+            }
+        }
+
+        return [];
+    }
+
+    /**
+     * Checks whether the current user may assign a custom status
+     *
+     * Mirrors the capability check of the saving routine, so a status is never
+     * offered to a user who is not allowed to apply it.
+     *
+     * @param string $post_type
+     * @return bool
+     * @since    1.1.0
+     */
+    private static function current_user_can_set_status($post_type = '')
+    {
+        $capability = 'publish_posts';
+
+        if ($post_type) {
+            $post_type_object = get_post_type_object($post_type);
+            if ($post_type_object && isset($post_type_object->cap->publish_posts)) {
+                $capability = $post_type_object->cap->publish_posts;
+            }
+        }
+
+        return current_user_can($capability);
+    }
+
+    /**
+     * Add the custom statuses to the classic editor status dropdown
      * The trac ticket is still open and there are no new changes until now, so
      * this is just a workaround :(
      * https://core.trac.wordpress.org/ticket/12706
      *
-     * @global type $post
+     * @global WP_Post $post
+     * @param string $hook_suffix
      * @since    1.0.0
      */
-    public function append_post_status_list()
+    public function enqueue_classic_editor_script($hook_suffix)
     {
+        if ('post.php' !== $hook_suffix && 'post-new.php' !== $hook_suffix) {
+            return;
+        }
+
         global $post;
-        $post_types = get_post_types();
-        $status = self::get_status();
-        if (in_array($post->post_type, $post_types)) {
-            foreach ($status as $single_status) {
-                $term_meta = get_option("taxonomy_term_$single_status->term_id");
-                $complete = '';
-                $hidden = 0;
-                if (array_key_exists('hide_in_drop_down', $term_meta) && $term_meta['hide_in_drop_down'] == 1) {
-                    $hidden = 1;
-                }
-                if ($post->post_status == $single_status->slug) {
-                    $complete = ' selected="selected"'; ?>
-                    <script type="text/javascript">
-                        jQuery(document).ready(function () {
-                            jQuery(".misc-pub-section span#post-status-display").append('<span id="post-status-display"><?php echo $single_status->name; ?></span>');
-                        });
-                    </script>
-                    <?php
-                }
-                if ($hidden == 0 || $post->post_status == $single_status->slug) {
-                    ?>
-                    <script type="text/javascript">
-                        jQuery(document).ready(function () {
-                            jQuery('select#post_status').append('<option value="<?php echo $single_status->slug; ?>" <?php echo $complete; ?>><?php echo $single_status->name; ?></option>');
-                        });
-                    </script>
-                    <?php
-                }
-            }
+        if (!$post instanceof WP_Post) {
+            return;
         }
-        foreach ($status as $single_status) {
-            $term_meta = get_option("taxonomy_term_$single_status->term_id");
-            $hidden = 0;
-            if (array_key_exists('hide_in_drop_down', $term_meta) && $term_meta['hide_in_drop_down'] == 1) {
-                $hidden = 1;
-            }
-            if ($hidden == 0) {
-                ?>
-                <script type="text/javascript">
-                    jQuery(document).ready(function () {
-                        jQuery('select[name="_status"]').append('<option value="<?php echo $single_status->slug; ?>"><?php echo $single_status->name; ?></option>');
-                    });
-                </script>
-                <?php
-            }
+
+        if (self::current_user_can_set_status($post->post_type)) {
+            $statuses = self::get_selectable_status($post->post_status);
+        } else {
+            /*
+             * A user who may not assign a status still needs the current one in
+             * the dropdown. Without it the browser would submit whatever option
+             * happens to be selected and silently reset the post to a draft.
+             */
+            $statuses = self::get_current_status_only($post->post_status);
         }
+
+        if (empty($statuses)) {
+            return;
+        }
+
+        wp_enqueue_script(
+            'extended-post-status-classic-editor',
+            plugin_dir_url(__DIR__) . 'admin/js/classic-editor.js',
+            ['jquery'],
+            $this->version,
+            true
+        );
+
+        // The data is passed as JSON and inserted through DOM methods in the
+        // script, so status names can never break out of the markup.
+        wp_localize_script(
+            'extended-post-status-classic-editor',
+            'extendedPostStatusClassicEditor',
+            [
+                'statuses' => $statuses,
+                'currentStatus' => $post->post_status,
+            ]
+        );
     }
 
     /**
-     * Add the custom post type to backend post quickedit status dropdown
+     * Add the custom statuses to the quick edit and bulk edit status dropdowns
      *
+     * @param string $hook_suffix
      * @since    1.0.0
      */
-    public function append_post_status_list_quickedit()
+    public function enqueue_quick_edit_script($hook_suffix)
     {
-        if (current_user_can('publish_posts')) {
-            $status = self::get_status();
-            foreach ($status as $single_status) {
-                $term_meta = get_option("taxonomy_term_$single_status->term_id");
-                $hidden = 0;
-                if (array_key_exists('hide_in_drop_down', $term_meta) && $term_meta['hide_in_drop_down'] == 1) {
-                    $hidden = 1;
-                } ?>
-                <script type="text/javascript">
-                    jQuery(document).ready(function () {
-                        jQuery('#bulk-edit select[name="_status"]').append('<option value="<?php echo $single_status->slug; ?>" class="hidden-<?php echo $hidden; ?>"><?php echo $single_status->name; ?></option>');
-                        jQuery('.quick-edit-row select[name="_status"]').append('<option value="<?php echo $single_status->slug; ?>" class="hidden-<?php echo $hidden; ?>"><?php echo $single_status->name; ?></option>');
-                    });
-                </script>
-            <?php
-            } ?>
-            <script type="text/javascript">
-                jQuery('#the-list').bind('DOMSubtreeModified', postListUpdated);
-
-                function postListUpdated() {
-                    // Wait for the quick-edit dom to change
-                    setTimeout(function () {
-                        var post_quickedit_tr_id = jQuery('.inline-editor').attr('id');
-                        if (post_quickedit_tr_id) {
-                            var post_edit_tr = post_quickedit_tr_id.replace("edit", "post");
-                            jQuery('.quick-edit-row select[name="_status"] option').each(function () {
-                                jQuery(this).show();
-                                if (jQuery(this).hasClass('hidden-1') && !jQuery('#' + post_edit_tr).hasClass('status-' + jQuery(this).val())) {
-                                    jQuery(this).hide();
-                                }
-                            });
-                        }
-                        jQuery('#bulk-edit select[name="_status"] option').each(function () {
-                            jQuery(this).show();
-                            if (jQuery(this).hasClass('hidden-1')) {
-                                jQuery(this).hide();
-                            }
-                        });
-                    }, 100);
-                }
-            </script>
-            <?php
+        if ('edit.php' !== $hook_suffix) {
+            return;
         }
+
+        $post_type = filter_input(INPUT_GET, 'post_type');
+        if (!$post_type) {
+            $post_type = 'post';
+        }
+
+        $can_set_status = self::current_user_can_set_status($post_type);
+
+        $statuses = [];
+        foreach (self::get_status() as $single_status) {
+            $settings = self::get_status_settings($single_status->term_id);
+
+            /*
+             * A hidden status is only offered for the row that already has it.
+             * Marking every status as hidden therefore keeps the current status
+             * of a row intact for users who may not assign statuses, without
+             * offering them any new one.
+             */
+            $hidden = ($can_set_status && !$settings['hide_in_drop_down']) ? 0 : 1;
+
+            $statuses[] = [
+                'slug' => $single_status->slug,
+                'name' => $single_status->name,
+                'hidden' => $hidden,
+            ];
+        }
+
+        if (empty($statuses)) {
+            return;
+        }
+
+        wp_enqueue_script(
+            'extended-post-status-quick-edit',
+            plugin_dir_url(__DIR__) . 'admin/js/quick-edit.js',
+            ['jquery', 'inline-edit-post'],
+            $this->version,
+            true
+        );
+
+        wp_localize_script(
+            'extended-post-status-quick-edit',
+            'extendedPostStatusQuickEdit',
+            ['statuses' => $statuses]
+        );
     }
 
     /**
      * Add status to post list
      *
-     * @global type $post
-     * @param type $statuses
-     * @return type
+     * @global WP_Post $post
+     * @param array $statuses
+     * @return array
      * @since    1.0.0
      */
     public function append_post_status_post_overview($statuses)
     {
         global $post;
-        $status = self::get_status();
-        if ($post) {
-            foreach ($status as $single_status) {
-                if ($single_status->slug == $post->post_status) {
-                    return [$single_status->name];
-                }
+
+        if (!$post instanceof WP_Post) {
+            return $statuses;
+        }
+
+        foreach (self::get_status() as $single_status) {
+            if ($single_status->slug === $post->post_status) {
+                // Core prints the post states unescaped, so the status name has
+                // to be escaped here.
+                return [esc_html($single_status->name)];
             }
         }
+
         return $statuses;
     }
 
     /**
-     * Add custom post type
+     * Register the custom post statuses
      *
      * @since    1.0.0
      */
     public function register_post_status()
     {
-        $status = self::get_status();
-        foreach ($status as $single_status) {
-            $term_meta = get_option("taxonomy_term_$single_status->term_id");
-            if (is_array($term_meta)) {
-                $args = [
-                    'label' => $single_status->name,
-                    'label_count' => _n_noop($single_status->name . ' <span class="count">(%s)</span>', $single_status->name . ' <span class="count">(%s)</span>'),
-                ];
-                if ((array_key_exists('public', $term_meta) && $term_meta['public'] == 1) || current_user_can('edit_posts')) {
-                    $args['public'] = true;
-                } else {
-                    $args['public'] = false;
-                }
-                if (array_key_exists('show_in_admin_all_list', $term_meta) && $term_meta['show_in_admin_all_list'] == 1) {
-                    $args['show_in_admin_all_list'] = true;
-                } else {
-                    $args['show_in_admin_all_list'] = false;
-                }
-                if (array_key_exists('show_in_admin_status_list', $term_meta) && $term_meta['show_in_admin_status_list'] == 1) {
-                    $args['show_in_admin_status_list'] = true;
-                } else {
-                    $args['show_in_admin_status_list'] = false;
-                }
-                if (array_key_exists('hide_in_drop_down', $term_meta) && $term_meta['hide_in_drop_down'] == 1) {
-                    $args['hide_in_drop_down'] = true;
-                } else {
-                    $args['hide_in_drop_down'] = false;
-                }
-                register_post_status($single_status->slug, $args);
+        foreach (self::get_status() as $single_status) {
+            $settings = self::get_status_settings($single_status->term_id);
+
+            // The label count is printed unescaped by the list table, so the
+            // status name has to be escaped here.
+            $count_label = esc_html($single_status->name) . ' <span class="count">(%s)</span>';
+
+            $args = [
+                'label' => $single_status->name,
+                // phpcs:ignore WordPress.WP.I18n.NonSingularStringLiteralSingular,WordPress.WP.I18n.NonSingularStringLiteralPlural
+                'label_count' => _n_noop($count_label, $count_label),
+                'show_in_admin_all_list' => (bool) $settings['show_in_admin_all_list'],
+                'show_in_admin_status_list' => (bool) $settings['show_in_admin_status_list'],
+                'hide_in_drop_down' => (bool) $settings['hide_in_drop_down'],
+            ];
+
+            if ($settings['public']) {
+                $args['public'] = true;
+            } else {
+                /*
+                 * Register non public statuses as protected, exactly like core
+                 * does for 'draft' and 'pending'.
+                 *
+                 * This keeps the posts out of every front end query while users
+                 * with editing capabilities can still preview them. Deciding
+                 * this per user - as previous versions did by checking
+                 * current_user_can() here - made the registration depend on the
+                 * current visitor, which leaked the posts into archives, feeds
+                 * and search results for every logged in editor and produced
+                 * inconsistent results behind a page cache.
+                 */
+                $args['public'] = false;
+                $args['protected'] = true;
             }
+
+            register_post_status($single_status->slug, $args);
         }
     }
 
@@ -255,78 +486,125 @@ class Extended_Post_Status_Admin
             'show_in_menu' => false,
             'meta_box_cb' => false,
         ];
-        register_taxonomy('status', 'post', $args);
+        register_taxonomy(self::TAXONOMY, 'post', $args);
     }
 
     /**
      * Manipulate the taxonomy form fields
      *
-     * @param type $tag
+     * Called for the "add new" form, where the first argument is the taxonomy
+     * name, and for the "edit" form, where it is the term object.
+     *
+     * @param string|WP_Term $tag
      * @since    1.0.0
      */
     public function status_taxonomy_custom_fields($tag)
     {
-        $returner = '';
-        $term_meta = false;
-        if (is_object($tag)) {
-            $t_id = $tag->term_id;
-            $term_meta = get_option("taxonomy_term_$t_id");
-        }
+        $is_edit_form = is_object($tag);
+        $settings = $is_edit_form ? self::get_status_settings($tag->term_id) : self::$setting_defaults;
+
         $fields = [
-            'public' => ['label' => __('Public', 'extended-post-status'), 'desc' => __('Posts/Pages with this status are public.', 'extended-post-status')],
-            'show_in_admin_all_list' => ['label' => __('Show posts in admin "All" list', 'extended-post-status'), 'desc' => __('Posts/Pages with this status will be listed in all posts/pages overview.', 'extended-post-status')],
-            'show_in_admin_status_list' => ['label' => __('Show status in admin status list', 'extended-post-status'), 'desc' => __('Status appears in status list.', 'extended-post-status')],
-            'hide_in_drop_down' => ['label' => __('Hide status in admin drop downs', 'extended-post-status'), 'desc' => __('Status is not selectable in the admin dropdowns.', 'extended-post-status')],
+            'public' => [
+                'label' => __('Public', 'extended-post-status'),
+                'desc' => __('Posts/Pages with this status are public.', 'extended-post-status'),
+            ],
+            'show_in_admin_all_list' => [
+                'label' => __('Show posts in admin "All" list', 'extended-post-status'),
+                'desc' => __('Posts/Pages with this status will be listed in all posts/pages overview.', 'extended-post-status'),
+            ],
+            'show_in_admin_status_list' => [
+                'label' => __('Show status in admin status list', 'extended-post-status'),
+                'desc' => __('Status appears in status list.', 'extended-post-status'),
+            ],
+            'hide_in_drop_down' => [
+                'label' => __('Hide status in admin drop downs', 'extended-post-status'),
+                'desc' => __('Status is not selectable in the admin dropdowns.', 'extended-post-status'),
+            ],
         ];
+
         foreach ($fields as $key => $value) {
-            $checked = '';
-            if ($term_meta && $term_meta[$key] == 1) {
-                $checked = 'checked="checked"';
+            $field_id = 'extended-post-status-' . $key;
+            $checkbox = sprintf(
+                '<input type="checkbox" name="term_meta[%1$s]" id="%2$s" value="1"%3$s /> %4$s',
+                esc_attr($key),
+                esc_attr($field_id),
+                checked(!empty($settings[$key]), true, false),
+                esc_html($value['label'])
+            );
+
+            /*
+             * The "add new" form is built from divs while the "edit" form is a
+             * table, so the wrapping markup has to differ.
+             */
+            if ($is_edit_form) {
+                printf(
+                    '<tr class="form-field"><th scope="row"><label for="%1$s">%2$s</label></th><td><p class="description">%3$s</p></td></tr>',
+                    esc_attr($field_id),
+                    $checkbox,
+                    esc_html($value['desc'])
+                );
+            } else {
+                printf(
+                    '<div class="form-field"><label for="%1$s">%2$s</label><p class="description">%3$s</p></div>',
+                    esc_attr($field_id),
+                    $checkbox,
+                    esc_html($value['desc'])
+                );
             }
-            $returner .= '
-                <tr class="form-field">
-                    <th scope="row" valign="top">
-                        <label for="term_meta[' . $key . ']"><input type="checkbox" name="term_meta[' . $key . ']" id="term_meta[' . $key . ']" value="1" ' . $checked . ' /> ' . $value['label'] . '</label>
-                    </th>
-                    <td>
-                        <label for="term_meta[' . $key . ']"><p>' . $value['desc'] . '</p></label><br />
-                    </td>
-                </tr>
-            ';
         }
-        echo $returner;
     }
 
     /**
      * Save the manipulated taxonomy form fields
      *
-     * @param type $term_id
+     * Only the known settings are stored and every value is cast to 0 or 1, so
+     * no arbitrary data can be written into the option.
+     *
+     * @param int $term_id
      * @since    1.0.0
      */
     public function save_status_taxonomy_custom_fields($term_id)
     {
-        $fields = ['public', 'show_in_admin_all_list', 'show_in_admin_status_list', 'hide_in_drop_down'];
-        $is_inline_edit = filter_input(INPUT_POST, '_inline_edit');
-
-        // Reset all custom checkbox fields
-        if (!$is_inline_edit) {
-            foreach ($fields as $field) {
-                $term_meta[$field] = 0;
-            }
-            update_option("taxonomy_term_$term_id", $term_meta);
+        if (!current_user_can('manage_categories')) {
+            return;
         }
 
-        // Update new values
-        if (isset($_POST['term_meta'])) {
-            $term_meta = get_option("taxonomy_term_$term_id");
-            $cat_keys = array_keys($_POST['term_meta']);
-            foreach ($cat_keys as $key) {
-                if (isset($_POST['term_meta'][$key])) {
-                    $term_meta[$key] = $_POST['term_meta'][$key];
-                }
-            }
-            update_option("taxonomy_term_$term_id", $term_meta);
+        $term_id = (int) $term_id;
+
+        /*
+         * Quick editing a status submits only the name and the slug. Keeping the
+         * stored settings in that case prevents them from being reset.
+         */
+        $is_inline_edit = (bool) filter_input(INPUT_POST, '_inline_edit');
+        if ($is_inline_edit) {
+            return;
         }
+
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing -- The nonce is verified by core before 'created_status'/'edited_status' fire.
+        $submitted = isset($_POST['term_meta']) && is_array($_POST['term_meta']) ? $_POST['term_meta'] : [];
+
+        $settings = [];
+        foreach (self::$setting_defaults as $key => $default) {
+            $settings[$key] = (isset($submitted[$key]) && $submitted[$key]) ? 1 : 0;
+        }
+
+        // These options are only read in the admin, so they do not need to be
+        // autoloaded on every single request.
+        update_option(self::SETTINGS_OPTION_PREFIX . $term_id, $settings, false);
+
+        self::flush_status_cache();
+    }
+
+    /**
+     * Remove the settings of a deleted status
+     *
+     * @param int $term_id
+     * @since    1.1.0
+     */
+    public function delete_status_taxonomy_custom_fields($term_id)
+    {
+        delete_option(self::SETTINGS_OPTION_PREFIX . (int) $term_id);
+        self::flush_status_cache();
     }
 
     /**
@@ -335,46 +613,40 @@ class Extended_Post_Status_Admin
      * field for statuses is limited to 20 chars
      *
      *
-     * @param type $data
-     * @param type $term_id
-     * @param type $taxonomy
-     * @param type $args
-     * @return type
+     * @param array $data
+     * @param int $term_id
+     * @param string $taxonomy
+     * @param array $args
+     * @return array
      * @since    1.0.2
      */
     public function override_status_taxonomy_on_save($data, $term_id, $taxonomy, $args)
     {
-        if ($taxonomy == 'status') {
-            $slug = $data['slug'];
-
-            // Cut slug if it is longer than 20 chars
-            if (strlen($slug) > 20) {
-                $data['slug'] = substr($slug, 0, 20);
-            }
+        if (self::TAXONOMY !== $taxonomy || !isset($data['slug'])) {
+            return $data;
         }
-        return $data;
-    }
 
-    /**
-     * Returns all status
-     *
-     * @return type
-     * @since    1.0.0
-     */
-    public static function get_status()
-    {
-        $args = [
-            'taxonomy' => 'status',
-            'hide_empty' => false,
-        ];
-        return get_terms($args);
+        $slug = $data['slug'];
+
+        // The post_status column holds 20 characters. Cutting the slug with a
+        // multibyte aware function avoids splitting a character in half.
+        if (strlen($slug) > 20) {
+            if (function_exists('mb_strcut')) {
+                $slug = mb_strcut($slug, 0, 20, 'UTF-8');
+            } else {
+                $slug = substr($slug, 0, 20);
+            }
+            $data['slug'] = sanitize_key(rtrim($slug, '-_'));
+        }
+
+        return $data;
     }
 
     /**
      * Edit the status taxonomy table
      *
-     * @param type $columns
-     * @return type
+     * @param array $columns
+     * @return array
      * @since    1.0.0
      */
     public function edit_status_taxonomy_columns($columns)
@@ -389,116 +661,93 @@ class Extended_Post_Status_Admin
     }
 
     /**
+     * Counts the posts of a post type
+     *
+     * Cached for the current request, because the status table calls this once
+     * per row and column.
+     *
+     * @param string $post_type
+     * @param string $status_slug
+     * @return int
+     * @since    1.1.0
+     */
+    private static function count_posts_with_status($post_type, $status_slug)
+    {
+        if (!isset(self::$count_cache[$post_type])) {
+            self::$count_cache[$post_type] = wp_count_posts($post_type);
+        }
+
+        $counts = self::$count_cache[$post_type];
+
+        return isset($counts->$status_slug) ? (int) $counts->$status_slug : 0;
+    }
+
+    /**
      * Add content to new created custom column in taxonomy table
      *
-     * @param type $content
-     * @param type $column_name
-     * @param type $term_id
+     * @param string $content
+     * @param string $column_name
+     * @param int $term_id
      * @return string
      * @since    1.0.0
      */
     public function add_status_taxonomy_columns_content($content, $column_name, $term_id)
     {
-        $content = '';
         $term = get_term($term_id);
-        $term_meta = get_option("taxonomy_term_$term_id");
-        if ('settings' == $column_name) {
-            if (array_key_exists('public', $term_meta) && $term_meta['public'] == 1) {
-                $content .= __('Public', 'extended-post-status') . ', ';
-            }
-            if (array_key_exists('show_in_admin_all_list', $term_meta) && $term_meta['show_in_admin_all_list'] == 1) {
-                $content .= __('Show in admin "All" list', 'extended-post-status') . ', ';
-            }
-            if (array_key_exists('show_in_admin_status_list', $term_meta) && $term_meta['show_in_admin_status_list'] == 1) {
-                $content .= __('Show in admin status list', 'extended-post-status') . ', ';
-            }
-            if (array_key_exists('hide_in_drop_down', $term_meta) && $term_meta['hide_in_drop_down'] == 1) {
-                $content .= __('Hide in admin drop downs', 'extended-post-status') . ', ';
-            }
-            $content = rtrim($content, ', ');
+        if (!$term instanceof WP_Term) {
+            return '';
         }
-        if ('count_posts' == $column_name) {
-            $count = wp_count_posts('post');
-            $slug = $term->slug;
-            $count_posts = 0;
-            if (property_exists($count, $slug)) {
-                $count_posts = $count->$slug;
-            }
-            $content .= '<a href="edit.php?post_status=' . $slug . '&post_type=post" target="_self">' . $count_posts . '</a>';
-        }
-        if ('count_pages' == $column_name) {
-            $count = wp_count_posts('page');
-            $slug = $term->slug;
-            $count_pages = 0;
-            if (property_exists($count, $slug)) {
-                $count_pages = $count->$slug;
-            }
-            $content .= '<a href="edit.php?post_status=' . $slug . '&post_type=page" target="_self">' . $count_pages . '</a>';
-        }
-        return $content;
-    }
 
-    /**
-     * Add status meta box to gutenberg editor
-     *
-     * @since    1.0.0
-     */
-    public function add_status_meta_box()
-    {
-        $is_block_editor = get_current_screen()->is_block_editor();
-        if ($is_block_editor && current_user_can('publish_posts')) {
-            add_meta_box('extended_post_status', __('Status', 'extended-post-status'), ['Extended_Post_Status_Admin', 'status_meta_box_content'], null, 'side', 'high');
-        }
-    }
+        $settings = self::get_status_settings($term_id);
 
-    /**
-     * Add meta box content
-     *
-     * @global type $post
-     * @since    1.0.0
-     */
-    public static function status_meta_box_content()
-    {
-        global $post;
-        $returner = '';
-        $statuses = self::get_all_status_array();
-        $returner .= '<select name="post_status_">';
-        $returner .= '<option value="none">' . __('- Select status -', 'extended-post-status') . '</option>';
-        foreach ($statuses as $key => $value) {
-            $term = get_term_by('slug', $key, 'status');
-            if ($term) {
-                $term_meta = get_option("taxonomy_term_$term->term_id");
-            }
-            $hidden = 0;
-            if ($term && array_key_exists('hide_in_drop_down', $term_meta) && $term_meta['hide_in_drop_down'] == 1) {
-                $hidden = 1;
-            }
-            if ($key == $post->post_status) {
-                $returner .= '<option value="' . $key . '" selected="selected">' . $value . '</option>';
-            } else {
-                if ($hidden == 0) {
-                    $returner .= '<option value="' . $key . '">' . $value . '</option>';
+        if ('settings' === $column_name) {
+            $labels = [
+                'public' => __('Public', 'extended-post-status'),
+                'show_in_admin_all_list' => __('Show in admin "All" list', 'extended-post-status'),
+                'show_in_admin_status_list' => __('Show in admin status list', 'extended-post-status'),
+                'hide_in_drop_down' => __('Hide in admin drop downs', 'extended-post-status'),
+            ];
+
+            $active = [];
+            foreach ($labels as $key => $label) {
+                if (!empty($settings[$key])) {
+                    $active[] = $label;
                 }
             }
+
+            return esc_html(implode(', ', $active));
         }
-        $returner .= '</select>';
-        echo $returner;
+
+        if ('count_posts' === $column_name || 'count_pages' === $column_name) {
+            $post_type = ('count_posts' === $column_name) ? 'post' : 'page';
+            $count = self::count_posts_with_status($post_type, $term->slug);
+            $url = add_query_arg(
+                [
+                    'post_status' => $term->slug,
+                    'post_type' => $post_type,
+                ],
+                admin_url('edit.php')
+            );
+
+            return '<a href="' . esc_url($url) . '">' . esc_html(number_format_i18n($count)) . '</a>';
+        }
+
+        return $content;
     }
 
     /**
      * Get array of all statuses
      *
-     * @return type
+     * Contains the core statuses as well as the custom ones.
+     *
+     * @return array
      * @since    1.0.0
      */
     public static function get_all_status_array()
     {
-        $statuses = [];
-        $core_statuses = get_post_statuses();
-        $statuses = $core_statuses;
-        $custom_statuses = self::get_status();
-        foreach ($custom_statuses as $status) {
-            $statuses[$status->slug] = $status->name;
+        $statuses = get_post_statuses();
+        foreach (self::get_status() as $single_status) {
+            $statuses[$single_status->slug] = $single_status->name;
         }
         return $statuses;
     }
@@ -506,13 +755,13 @@ class Extended_Post_Status_Admin
     /**
      * Initialize the view for the overridden query
      *
-     * @global type $pagenow
+     * @global string $pagenow
      * @since    1.0.1
      */
     public function override_admin_post_list_init()
     {
         global $pagenow;
-        if ('edit.php' == $pagenow) {
+        if ('edit.php' === $pagenow) {
             add_action('parse_query', ['Extended_Post_Status_Admin', 'override_admin_post_list']);
         }
     }
@@ -520,48 +769,35 @@ class Extended_Post_Status_Admin
     /**
      * Override the post query
      *
-     * @param type $query
-     * @return type
+     * Core already builds the "All" list from the public statuses plus every
+     * protected status that opted into it, so the only case left to handle is a
+     * public status that asked to be hidden from that list.
+     *
+     * @param WP_Query $query
      * @since    1.0.1
      */
     public static function override_admin_post_list($query)
     {
-        $statuses = self::get_status();
-        // Check if query has no further params
-        if ((array_key_exists('post_status', $query->query) && empty($query->query['post_status']))) {
-            $statuses_show_in_admin_all_list = self::get_all_post_statuses();
-            foreach ($statuses as $status) {
-                $term_meta = get_option("taxonomy_term_$status->term_id");
-                if (!in_array($status->slug, $statuses_show_in_admin_all_list)) {
-                    if ($term_meta['show_in_admin_all_list'] == 1) {
-                        $statuses_show_in_admin_all_list[] = $status->slug;
-                    }
-                } else {
-                    if ($term_meta['show_in_admin_all_list'] != 1) {
-                        if (($key = array_search($status->slug, $statuses_show_in_admin_all_list)) !== false) {
-                            unset($statuses_show_in_admin_all_list[$key]);
-                        }
-                    }
-                }
-            }
-
-            set_query_var('post_status', array_values($statuses_show_in_admin_all_list));
+        // Only act on the unfiltered "All" view.
+        if (!array_key_exists('post_status', $query->query) || !empty($query->query['post_status'])) {
             return;
         }
-        return;
-    }
 
-    /**
-     * Get all available post statuses
-     *
-     * @return array
-     * @since    1.0.17
-     */
-    private static function get_all_post_statuses()
-    {
-        global $wpdb;
-        $query = $wpdb->get_results("SELECT DISTINCT $wpdb->posts.post_status as post_status FROM $wpdb->posts WHERE post_status NOT IN ('auto-draft', 'trash', 'inherit')");
-        return wp_list_pluck($query, 'post_status');
+        $needs_override = false;
+        foreach (self::get_status() as $single_status) {
+            $settings = self::get_status_settings($single_status->term_id);
+            if ($settings['public'] && !$settings['show_in_admin_all_list']) {
+                $needs_override = true;
+                break;
+            }
+        }
+
+        if (!$needs_override) {
+            return;
+        }
+
+        $statuses = get_post_stati(['show_in_admin_all_list' => true]);
+        $query->set('post_status', array_values($statuses));
     }
 
     /**
@@ -578,7 +814,11 @@ class Extended_Post_Status_Admin
         register_setting(
             'writing',
             'extended-post-status-add-extra-admin-menu-item',
-            ['Extended_Post_Status_Admin', 'settings_sanitize']
+            [
+                'type' => 'boolean',
+                'default' => false,
+                'sanitize_callback' => ['Extended_Post_Status_Admin', 'settings_sanitize'],
+            ]
         );
         add_settings_section(
             'extended-post-status-settings',
@@ -588,7 +828,7 @@ class Extended_Post_Status_Admin
         );
         add_settings_field(
             'extended-post-status-add-extra-admin-menu-item',
-            '<label for="extended-post-status-add-extra-admin-menu-item">' . __('Move status to main admin menu.', 'extended-post-status') . '</label>',
+            '<label for="extended-post-status-add-extra-admin-menu-item">' . esc_html__('Move status to main admin menu.', 'extended-post-status') . '</label>',
             ['Extended_Post_Status_Admin', 'settings_extra_admin_menu_item_field'],
             'writing',
             'extended-post-status-settings'
@@ -598,13 +838,13 @@ class Extended_Post_Status_Admin
     /**
      * Sanitize setting page input
      *
-     * @param type $input
-     * @return type
+     * @param mixed $input
+     * @return bool
      * @since    1.0.4
      */
     public static function settings_sanitize($input)
     {
-        return isset($input) ? true : false;
+        return !empty($input);
     }
 
     /**
@@ -614,7 +854,7 @@ class Extended_Post_Status_Admin
      */
     public static function settings_section_description()
     {
-        echo __('Settings for post status handling.', 'extended-post-status');
+        echo '<p>' . esc_html__('Settings for post status handling.', 'extended-post-status') . '</p>';
     }
 
     /**
@@ -624,10 +864,10 @@ class Extended_Post_Status_Admin
      */
     public static function settings_extra_admin_menu_item_field()
     {
-        $returner = '
-            <input id="extended-post-status-add-extra-admin-menu-item" type="checkbox" value="1" name="extended-post-status-add-extra-admin-menu-item"' . checked(get_option('extended-post-status-add-extra-admin-menu-item', false), true, false) . '>
-        ';
-        echo $returner;
+        printf(
+            '<input id="extended-post-status-add-extra-admin-menu-item" type="checkbox" value="1" name="extended-post-status-add-extra-admin-menu-item"%s>',
+            checked(get_option('extended-post-status-add-extra-admin-menu-item', false), true, false)
+        );
     }
 
     /**
@@ -645,17 +885,35 @@ class Extended_Post_Status_Admin
     }
 
     /**
+     * Render the faked status admin menu page
+     *
+     * The menu item is redirected to the taxonomy screen by admin_redirects(),
+     * so this is only a fallback for the case the redirect did not happen.
+     *
+     * @since    1.1.0
+     */
+    public static function admin_menu_link_extended_post_status_taxonomy()
+    {
+        printf(
+            '<div class="wrap"><h1>%1$s</h1><p><a href="%2$s">%3$s</a></p></div>',
+            esc_html__('Extended Post Status', 'extended-post-status'),
+            esc_url(admin_url('edit-tags.php?taxonomy=' . self::TAXONOMY)),
+            esc_html__('All statuses', 'extended-post-status')
+        );
+    }
+
+    /**
      * Redirects in admin context
      * - Redirect the main admin menu status page to original taxonomy page
      *
-     * @global type $pagenow
+     * @global string $pagenow
      * @since    1.0.4
      */
     public function admin_redirects()
     {
         global $pagenow;
-        if (($pagenow == 'admin.php' || $pagenow == 'options-general.php') && filter_input(INPUT_GET, 'page') == 'extended-post-status-taxonomy') {
-            wp_redirect(admin_url('edit-tags.php?taxonomy=status'), 301);
+        if (('admin.php' === $pagenow || 'options-general.php' === $pagenow) && 'extended-post-status-taxonomy' === filter_input(INPUT_GET, 'page')) {
+            wp_safe_redirect(admin_url('edit-tags.php?taxonomy=' . self::TAXONOMY), 302);
             exit;
         }
     }
@@ -670,14 +928,16 @@ class Extended_Post_Status_Admin
      */
     public function parent_file($parent_file)
     {
-        if (get_current_screen()->taxonomy == 'status') {
-            if (get_option('extended-post-status-add-extra-admin-menu-item', false)) {
-                $parent_file = 'extended-post-status-taxonomy';
-            } else {
-                $parent_file = 'options-general.php';
-            }
+        $screen = get_current_screen();
+        if (!$screen || self::TAXONOMY !== $screen->taxonomy) {
+            return $parent_file;
         }
-        return $parent_file;
+
+        if (get_option('extended-post-status-add-extra-admin-menu-item', false)) {
+            return 'extended-post-status-taxonomy';
+        }
+
+        return 'options-general.php';
     }
 
     /**
@@ -690,8 +950,9 @@ class Extended_Post_Status_Admin
      */
     public function submenu_file($submenu_file)
     {
-        if (get_current_screen()->taxonomy == 'status') {
-            $submenu_file = 'extended-post-status-taxonomy';
+        $screen = get_current_screen();
+        if ($screen && self::TAXONOMY === $screen->taxonomy) {
+            return 'extended-post-status-taxonomy';
         }
         return $submenu_file;
     }
@@ -702,74 +963,258 @@ class Extended_Post_Status_Admin
      * - If the post is a planned post for the future, don't do this!
      * - If no custom status is set (equals 'none'), set post status to draft
      *
-     * @param type $data
-     * @param type $postarr
-     * @return type
+     * The submitted status is validated against the known statuses, so an
+     * arbitrary value can never end up in the database.
+     *
+     * @param array $data
+     * @param array $postarr
+     * @return array
      * @since    1.0.13
      */
     public function wp_insert_post_data($data, $postarr)
     {
-        if (current_user_can('publish_posts')) {
-            if (array_key_exists('post_status_', $postarr) && $data['post_status'] != 'trash' && $data['post_status'] != 'future') {
-                $data['post_status'] = $postarr['post_status_'];
-            }
-            if ($data['post_status'] == 'none') {
-                $data['post_status'] = 'draft';
-            }
+        if (!array_key_exists('post_status_', $postarr)) {
+            return $data;
         }
+
+        $post_type = isset($data['post_type']) ? $data['post_type'] : '';
+        if (!self::current_user_can_set_status($post_type)) {
+            return $data;
+        }
+
+        // Never touch a post on its way to the trash or a scheduled post. This
+        // has to be checked before the 'none' fallback, otherwise trashing a
+        // post would turn it into a draft.
+        if ('trash' === $data['post_status'] || 'future' === $data['post_status']) {
+            return $data;
+        }
+
+        $requested = $postarr['post_status_'];
+
+        if ('none' === $requested) {
+            $data['post_status'] = 'draft';
+            return $data;
+        }
+
+        if (array_key_exists($requested, self::get_all_status_array())) {
+            $data['post_status'] = $requested;
+        }
+
         return $data;
     }
 
     /**
-     * Override the text on the Gutenberg publish button
-     * - This is done to prevent confusion while publishing or saving a post
+     * Hook the status validation into every post type handled by the REST API
+     *
+     * @since    1.1.0
+     */
+    public function register_rest_status_validation()
+    {
+        // The filter is built from the post type name, not from the rest base.
+        foreach (get_post_types(['show_in_rest' => true]) as $post_type) {
+            add_filter('rest_pre_insert_' . $post_type, ['Extended_Post_Status_Admin', 'rest_pre_insert_post'], 10, 2);
+        }
+    }
+
+    /**
+     * Reject custom statuses for users who may not publish
+     *
+     * The REST API lets every registered status pass as long as the user can
+     * edit the post, so the capability check has to be repeated here.
+     *
+     * @param stdClass $prepared_post
+     * @param WP_REST_Request $request
+     * @return stdClass|WP_Error
+     * @since    1.1.0
+     */
+    public static function rest_pre_insert_post($prepared_post, $request)
+    {
+        if (empty($prepared_post->post_status)) {
+            return $prepared_post;
+        }
+
+        $custom_slugs = wp_list_pluck(self::get_status(), 'slug');
+        if (!in_array($prepared_post->post_status, $custom_slugs, true)) {
+            return $prepared_post;
+        }
+
+        /*
+         * Only assigning a new custom status requires the capability. Saving a
+         * post that already has it must keep working, because the block editor
+         * sends the unchanged status along with every update.
+         */
+        if (!empty($prepared_post->ID) && get_post_status($prepared_post->ID) === $prepared_post->post_status) {
+            return $prepared_post;
+        }
+
+        $post_type = isset($prepared_post->post_type) ? $prepared_post->post_type : $request->get_param('type');
+        if (!$post_type && !empty($prepared_post->ID)) {
+            $post_type = get_post_type($prepared_post->ID);
+        }
+
+        if (!self::current_user_can_set_status($post_type)) {
+            return new WP_Error(
+                'extended_post_status_cannot_assign',
+                __('Sorry, you are not allowed to assign this status.', 'extended-post-status'),
+                ['status' => rest_authorization_required_code()]
+            );
+        }
+
+        return $prepared_post;
+    }
+
+    /**
+     * Register the block editor assets
+     *
+     * Adds the status control to the editor sidebar. Core builds its own status
+     * control from a hard coded list, so a custom status would show up without
+     * a label there.
      *
      * @since    1.0.18
      */
-    public function change_publish_button_gutenberg()
+    public function enqueue_block_editor_assets()
     {
-        if (wp_script_is('wp-i18n') && current_user_can('publish_posts')) {
-            ?>
-            <script type="text/javascript">
-                wp.i18n.setLocaleData({'Publish': ['<?php echo __('Save'); ?>']});
-            </script>
-            <?php
+        $post = get_post();
+        $post_type = $post instanceof WP_Post ? $post->post_type : '';
+
+        if (!self::current_user_can_set_status($post_type)) {
+            return;
         }
+
+        wp_enqueue_script(
+            'extended-post-status-editor',
+            plugin_dir_url(__DIR__) . 'admin/js/editor-status-panel.js',
+            ['wp-plugins', 'wp-element', 'wp-components', 'wp-compose', 'wp-data', 'wp-i18n'],
+            $this->version,
+            true
+        );
+
+        // The core statuses come first, followed by the selectable custom ones,
+        // so the control can replace the core status control entirely.
+        $current_status = $post instanceof WP_Post ? $post->post_status : '';
+        $statuses = [];
+        foreach (get_post_statuses() as $slug => $name) {
+            $statuses[] = [
+                'slug' => $slug,
+                'name' => $name,
+            ];
+        }
+        $statuses = array_merge($statuses, self::get_selectable_status($current_status));
+
+        wp_localize_script(
+            'extended-post-status-editor',
+            'extendedPostStatusEditor',
+            ['statuses' => $statuses]
+        );
+
+        wp_set_script_translations('extended-post-status-editor', 'extended-post-status');
+
+        $this->enqueue_publishing_sidebar_script();
     }
 
     /**
      * Remove the "two click" publishing sidebar
      * - See: https://github.com/WordPress/gutenberg/issues/9077#issuecomment-458309231
      *
+     * The preference is stored per user since WordPress 7.0, so it is only set
+     * once instead of on every editor load. Otherwise the user could never turn
+     * the pre-publish checks back on.
+     *
      * @since    1.0.18
      */
-    public function remove_publishing_sidebar_gutenberg()
+    private function enqueue_publishing_sidebar_script()
     {
-        if (current_user_can('publish_posts')) {
-            wp_enqueue_script('disablePublishSidebar', plugin_dir_url(__DIR__) . 'admin/js/disablePublishSidebar.js', ['jquery']);
+        $user_id = get_current_user_id();
+
+        // Without a user the preference cannot be remembered, which would
+        // enqueue the script on every single load.
+        if (!$user_id) {
+            return;
+        }
+
+        if (get_user_meta($user_id, '_extended_post_status_publish_sidebar_disabled', true)) {
+            return;
+        }
+
+        update_user_meta($user_id, '_extended_post_status_publish_sidebar_disabled', 1);
+
+        wp_enqueue_script(
+            'extended-post-status-publish-sidebar',
+            plugin_dir_url(__DIR__) . 'admin/js/disable-publish-sidebar.js',
+            ['wp-data', 'wp-dom-ready'],
+            $this->version,
+            true
+        );
+    }
+
+    /**
+     * Register the string overrides on the editor screens only
+     *
+     * The gettext filter runs for every single translated string, so it must
+     * not be registered on screens that do not need it.
+     *
+     * @since    1.1.0
+     */
+    public function register_editor_string_overrides()
+    {
+        add_filter('gettext', ['Extended_Post_Status_Admin', 'gettext_override'], 10, 3);
+        add_action('admin_print_footer_scripts', [$this, 'change_publish_button_gutenberg'], 11);
+    }
+
+    /**
+     * Override the text on the publish button
+     * - This is done to prevent confusion while publishing or saving a post
+     *
+     * @since    1.0.18
+     */
+    public function change_publish_button_gutenberg()
+    {
+        if (wp_script_is('wp-i18n') && self::current_user_can_set_status(get_post_type())) {
+            printf(
+                '<script type="text/javascript">wp.i18n.setLocaleData(%s);</script>',
+                wp_json_encode(['Publish' => [__('Save')]])
+            );
         }
     }
 
     /**
      * Override gettext snippets
      *
-     * @param type $translated
-     * @param type $original
-     * @param type $domain
-     * @return type
+     * Only core strings are considered and the capability is checked after the
+     * string matched, because this filter runs thousands of times per request.
+     *
+     * @param string $translated
+     * @param string $original
+     * @param string $domain
+     * @return string
      * @since    1.0.18
      */
-    public function gettext_override($translated, $original, $domain)
+    public static function gettext_override($translated, $original, $domain)
     {
-        if ($original == 'Publish' && current_user_can('publish_posts')) {
-            $translated = __('Save');
+        if ('default' !== $domain) {
+            return $translated;
         }
-        if (($original == 'Post published.' || $original == 'Post reverted to draft.') && current_user_can('publish_posts')) {
-            $translated = __('Post saved.');
+
+        switch ($original) {
+            case 'Publish':
+                $replacement = 'Save';
+                break;
+            case 'Post published.':
+            case 'Post reverted to draft.':
+                $replacement = 'Post saved.';
+                break;
+            case 'Page published.':
+            case 'Page reverted to draft.':
+                $replacement = 'Page saved.';
+                break;
+            default:
+                return $translated;
         }
-        if (($original == 'Page published.' || $original == 'Page reverted to draft.') && current_user_can('publish_posts')) {
-            $translated = __('Page saved.');
+
+        if (!self::current_user_can_set_status(get_post_type())) {
+            return $translated;
         }
-        return $translated;
+
+        return __($replacement);
     }
 }
