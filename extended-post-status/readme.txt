@@ -4,7 +4,7 @@ Tags: status, post, publishing, extended, post type
 Requires at least: 5.0
 Tested up to: 7.1
 Requires PHP: 7.2
-Stable tag: 1.1.0
+Stable tag: 1.1.1
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
 
@@ -63,10 +63,16 @@ Furthermore, the publishing sidebar of Gutenberg has been removed.
 
 == Upgrade Notice ==
 
+= 1.1.1 =
+Maintenance release. Identical to 1.1.0 in functionality, published to correct the 1.1.0 release package.
+
 = 1.1.0 =
 Compatibility release for WordPress 7.0. Please note one behaviour change: posts with a non public custom status are no longer listed in front end archives, feeds and search results for logged in editors. They stay previewable through their own URL, exactly like a draft. If you relied on the old behaviour, enable the "Public" option for that status.
 
 == Changelog ==
+
+= 1.1.1 =
+* [Changed] Maintenance release without functional changes, published to correct the 1.1.0 release package
 
 = 1.1.0 =
 * [Added] Support for WordPress 7.0, still compatible with WordPress 5.0 and above
